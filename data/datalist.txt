@@ -1,0 +1,6 @@
+0= _default_
+1= X68KBBS
+2= X68KBBS192x144
+3= GYABAN
+4= LoLi
+
