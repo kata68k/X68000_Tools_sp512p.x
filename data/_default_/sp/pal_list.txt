@@ -1,0 +1,4 @@
+;スコア
+;0 = (TEXT/SP共用エリア)
+0  = output.pal
+1  = output.pal
