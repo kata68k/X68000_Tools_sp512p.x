@@ -1,0 +1,4 @@
+;   BGM_INIT,
+0 = init.ZMD
+;   BGM_STOP,
+1 = STOP.ZMD

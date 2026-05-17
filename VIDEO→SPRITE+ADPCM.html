@@ -1,0 +1,477 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>VIDEO → SPRITE + ADPCM コンバーター</title>
+</head>
+<body>
+<h1>VIDEO → SPRITE + ADPCM コンバーター ver1.0.0</h1>
+<input type="file" id="fileInput" accept="video/*">
+<br>
+幅: <input type="number" id="w" value="240">
+高さ: <input type="number" id="h" value="128">
+<br>
+FPS間引き: <input type="number" id="skip" value="2">
+<br><br>
+
+<button onclick="start()">変換開始</button>
+<div id="log">待機中</div>
+
+<script>
+
+// =========================
+// ログ
+// =========================
+function logProgress(frame,total,startTime){
+    const now=performance.now();
+    const p=((frame/total)*100).toFixed(1);
+    const e=(now-startTime)/1000;
+    const r=(e/(frame+1))*(total-frame);
+    log.textContent=`進捗 ${p}% (${frame}/${total}) 残り ${r.toFixed(1)}s`;
+}
+
+// =========================
+// メイン
+// =========================
+async function start(){
+
+    const file=fileInput.files[0];
+    if(!file){alert("動画を選択");return;}
+
+    const W=+w.value,H=+h.value,SKIP=+skip.value;
+
+    log.textContent="音声処理中...";
+
+    const audioBuffer=await extractAudio(file);
+
+    let pcm=toMono(audioBuffer.getChannelData(0),audioBuffer);
+    pcm=removeDC(pcm);
+	pcm=preEmphasis(pcm);
+    pcm=lowpass(pcm);
+	pcm = normalize(pcm);
+	pcm = softClip(pcm);
+
+// リサンプル後にも軽く整えるとさらに良い
+	const resampled = resample15600(pcm, audioBuffer.sampleRate);
+
+	const safe = normalize(resampled);
+	const clipped = softClip(safe);
+
+	const int16 = floatToInt16Safe(clipped);
+
+    download(encodeWAV(audioBuffer),"out.wav");
+//  download(pcmToAdpcm(int16),"out.pcm");
+
+    log.textContent="映像処理中...";
+
+    const video=document.createElement("video");
+    video.src=URL.createObjectURL(file);
+    await video.play(); video.pause();
+
+    const canvas=document.createElement("canvas");
+    canvas.width=W; canvas.height=H;
+    const ctx=canvas.getContext("2d");
+    ctx.imageSmoothingEnabled=false;
+
+    let spList=[],palList=[];
+
+    const fps=30;
+    const step=(1/fps)*SKIP;
+    const total=Math.floor(video.duration/step);
+    const startTime=performance.now();
+
+    for(let t=0,frame=0;t<video.duration;t+=step,frame++){
+
+        await seek(video,t);
+        ctx.drawImage(video,0,0,W,H);
+
+        const palette=createPalette16(ctx,W,H);
+        const sp=convert(ctx,W,H,palette);
+        const pal=makePAL16(palette);
+
+        spList.push(sp);
+        palList.push(pal);
+
+        if(frame%5===0){
+            logProgress(frame,total,startTime);
+            await sleep(0);
+        }
+    }
+
+    finish(spList,palList);
+    log.textContent="完了！";
+}
+
+// =========================
+// 音声改善
+// =========================
+function removeDC(d){
+    let sum=0;
+    for(let i=0;i<d.length;i++) sum+=d[i];
+    const avg=sum/d.length;
+    const out=new Float32Array(d.length);
+    for(let i=0;i<d.length;i++) out[i]=d[i]-avg;
+    return out;
+}
+
+function lowpass(d){
+    const o=new Float32Array(d.length);
+    o[0]=d[0];
+    for(let i=1;i<d.length;i++) o[i]=(d[i]+d[i-1])*0.5;
+    return o;
+}
+
+function resample15600(d,src){
+    const dst=15600;
+    const r=src/dst;
+    const o=new Float32Array(d.length/r);
+
+    for(let i=0;i<o.length;i++){
+        const p=i*r;
+        const i0=p|0;
+        const i1=Math.min(i0+1,d.length-1);
+        const f=p-i0;
+        o[i]=d[i0]*(1-f)+d[i1]*f;
+    }
+    return o;
+}
+
+function normalize(data){
+
+    let max = 0;
+
+    for(let i=0;i<data.length;i++){
+        const a = Math.abs(data[i]);
+        if(a > max) max = a;
+    }
+
+    // 無音対策
+    if(max < 1e-5) return data;
+
+    const gain = 1 / max; // ★ ヘッドルーム確保
+
+    const out = new Float32Array(data.length);
+
+    for(let i=0;i<data.length;i++){
+        out[i] = data[i] * gain;
+    }
+
+    return out;
+}
+
+function softClip(data){
+
+    const out = new Float32Array(data.length);
+
+    for(let i=0;i<data.length;i++){
+        let x = data[i];
+
+        // tanh近似（軽い版）
+        out[i] = x / (1 + Math.abs(x));
+    }
+
+    return out;
+}
+
+function floatToInt16Safe(data){
+
+    const out = new Int16Array(data.length);
+
+    for(let i=0;i<data.length;i++){
+        let s = data[i];
+
+        // 最終ガード
+        if(s > 1) s = 1;
+        if(s < -1) s = -1;
+
+        out[i] = s * 32767;
+    }
+
+    return out;
+}
+
+// =========================
+// 減色（改善版）
+// =========================
+function createPalette16(ctx,w,h){
+
+    const d=ctx.getImageData(0,0,w,h).data;
+
+    const colorMap=new Map();
+
+    for(let i=0;i<d.length;i+=4){
+
+        // ★ 黒は除外
+        if(d[i]<8 && d[i+1]<8 && d[i+2]<8) continue;
+
+        const key=(d[i]<<16)|(d[i+1]<<8)|d[i+2];
+        colorMap.set(key,(colorMap.get(key)||0)+1);
+    }
+
+    const pixels=[];
+
+    colorMap.forEach((count,key)=>{
+        pixels.push([
+            (key>>16)&255,
+            (key>>8)&255,
+            key&255,
+            count
+        ]);
+    });
+
+    function medianCut(pix,depth){
+
+        if(depth===0||pix.length===0){
+            let r=0,g=0,b=0,total=0;
+
+            pix.forEach(p=>{
+                r+=p[0]*p[3];
+                g+=p[1]*p[3];
+                b+=p[2]*p[3];
+                total+=p[3];
+            });
+
+            total=total||1;
+            return [[r/total,g/total,b/total]];
+        }
+
+        let axis=0;
+        let ranges=[0,0,0];
+
+        for(let c=0;c<3;c++){
+            let min=255,max=0;
+            pix.forEach(p=>{
+                if(p[c]<min)min=p[c];
+                if(p[c]>max)max=p[c];
+            });
+            ranges[c]=max-min;
+        }
+
+        axis=ranges.indexOf(Math.max(...ranges));
+
+        pix.sort((a,b)=>a[axis]-b[axis]);
+
+        const mid=pix.length>>1;
+
+        return [
+            ...medianCut(pix.slice(0,mid),depth-1),
+            ...medianCut(pix.slice(mid),depth-1)
+        ];
+    }
+
+    let cols=medianCut(pixels,4).slice(0,15);
+
+    const palette=[{r:0,g:0,b:0}];
+
+    cols.forEach(c=>{
+        palette.push({r:c[0]|0,g:c[1]|0,b:c[2]|0});
+    });
+
+    while(palette.length<16){
+        palette.push({r:0,g:0,b:0});
+    }
+
+    return palette;
+}
+
+// =========================
+// 以下既存
+// =========================
+async function extractAudio(file){
+    const buf=await file.arrayBuffer();
+    const ctx=new AudioContext();
+    return await ctx.decodeAudioData(buf);
+}
+
+function toMono(pcm,a){
+    if(a.numberOfChannels===1)return pcm;
+    const c2=a.getChannelData(1);
+    const o=new Float32Array(pcm.length);
+    for(let i=0;i<o.length;i++) o[i]=(pcm[i]+c2[i])*0.5;
+    return o;
+}
+
+function encodeWAV(b){
+    const ab=new ArrayBuffer(44+b.length*2);
+    const dv=new DataView(ab);
+    let o=0;
+    const w=s=>{for(let i=0;i<s.length;i++)dv.setUint8(o++,s.charCodeAt(i));};
+    const w16=v=>{dv.setUint16(o,v,true);o+=2;}
+    const w32=v=>{dv.setUint32(o,v,true);o+=4;}
+    w("RIFF");w32(36+b.length*2);w("WAVEfmt ");w32(16);w16(1);
+    w16(1);w32(b.sampleRate);w32(b.sampleRate*2);w16(2);w16(16);
+    w("data");w32(b.length*2);
+    for(let i=0;i<b.length;i++){
+        let s=b.getChannelData(0)[i];
+        dv.setInt16(o,s*32767,true);o+=2;
+    }
+    return ab;
+}
+
+function pcmToAdpcm(samples){
+
+    // --- 初期値（ここ重要） ---
+    let predictor = samples[0] || 0; // 初期値を先頭サンプルに
+    let index = 10;                  // 少し大きめで立ち上がり改善
+
+    const out = new Uint8Array(Math.ceil(samples.length / 2));
+
+    // --- OKI標準テーブル ---
+    const stepSizeTable = [
+        16,17,19,21,23,25,28,31,
+        34,37,41,45,50,55,60,66,
+        73,80,88,97,107,118,130,143,
+        157,173,190,209,230,253,279,307,
+        337,371,408,449,494,544,598,658,
+        724,796,876,963,1060,1166,1282,1411,
+        1552
+    ];
+
+    const indexTable = [
+        -1,-1,-1,-1,2,4,6,8,
+        -1,-1,-1,-1,2,4,6,8
+    ];
+
+    let step = stepSizeTable[index];
+
+    let outPos = 0;
+    let high = true;
+    let byte = 0;
+
+    for(let i=0;i<samples.length;i++){
+
+        let sample = samples[i];
+
+        let diff = sample - predictor;
+        let sign = 0;
+
+        if(diff < 0){
+            sign = 8;
+            diff = -diff;
+        }
+
+        // --- 量子化 ---
+        let delta = 0;
+        let temp = step;
+
+        if(diff >= temp){ delta |= 4; diff -= temp; }
+        temp >>= 1;
+        if(diff >= temp){ delta |= 2; diff -= temp; }
+        temp >>= 1;
+        if(diff >= temp){ delta |= 1; }
+
+        let nibble = delta | sign;
+
+        // --- 逆量子化 ---
+        let diffq = step >> 3;
+
+        if(delta & 4) diffq += step;
+        if(delta & 2) diffq += step >> 1;
+        if(delta & 1) diffq += step >> 2;
+
+        if(sign) predictor -= diffq;
+        else predictor += diffq;
+
+        // --- クリップ ---
+        if(predictor > 32767) predictor = 32767;
+        if(predictor < -32768) predictor = -32768;
+
+        // --- ステップ更新 ---
+        index += indexTable[nibble];
+
+        if(index < 0) index = 0;
+        if(index > 48) index = 48;
+
+        step = stepSizeTable[index];
+
+        // --- パック ---
+        if(high){
+            byte = nibble << 4;
+            high = false;
+        }else{
+            byte |= nibble;
+            out[outPos++] = byte;
+            high = true;
+        }
+    }
+
+    return out;
+}
+
+function preEmphasis(data){
+    const out = new Float32Array(data.length);
+    out[0] = data[0];
+    for(let i=1;i<data.length;i++){
+        out[i] = data[i] - 0.95 * data[i-1];
+    }
+    return out;
+}
+
+function seek(v,t){return new Promise(r=>{v.currentTime=t;v.onseeked=r;});}
+function sleep(ms){return new Promise(r=>setTimeout(r,ms));}
+
+function findColorIndex(r,g,b,p,c){
+    const k=(r<<16)|(g<<8)|b;
+    if(c[k]!=null)return c[k];
+    let best=0,bd=1e9;
+    for(let i=0;i<p.length;i++){
+        const dr=r-p[i].r,dg=g-p[i].g,db=b-p[i].b;
+        const d=dr*dr+dg*dg+db*db;
+        if(d<bd){bd=d;best=i;}
+    }
+    return c[k]=best;
+}
+
+function convert(ctx,w,h,p){
+    const d=ctx.getImageData(0,0,w,h).data;
+    const idx=new Uint8Array(w*h),c={};
+    let j=0;
+    for(let i=0;i<d.length;i+=4)
+        idx[j++]=findColorIndex(d[i],d[i+1],d[i+2],p,c);
+    return makeSP(idx,w,h);
+}
+
+function makeSP(idx,w,h){
+    const o=new Uint8Array((w*h)>>1);
+    let p=0;
+    for(let yl=0;yl<h;yl+=16)
+    for(let xl=0;xl<w;xl+=8)
+    for(let y=0;y<16;y++)
+    for(let x=0;x<8;x+=2){
+        const i=(yl+y)*w+(xl+x);
+        o[p++]=(idx[i]<<4)|idx[i+1];
+    }
+    return o;
+}
+
+function makePAL16(p){
+    const o=new Uint8Array(32);
+    for(let i=0;i<16;i++){
+        const r=p[i].r>>3,g=p[i].g>>3,b=p[i].b>>3;
+        const c=(g<<11)|(r<<6)|(b<<1);
+        o[i*2]=c>>8;o[i*2+1]=c&255;
+    }
+    return o;
+}
+
+function finish(spList,palList){
+    let s=0;spList.forEach(d=>s+=d.length);
+    const sp=new Uint8Array(s);
+    let o=0;spList.forEach(d=>{sp.set(d,o);o+=d.length;});
+    s=0;palList.forEach(d=>s+=d.length);
+    const pal=new Uint8Array(s);
+    o=0;palList.forEach(d=>{pal.set(d,o);o+=d.length;});
+    download(sp,"out.SP");
+    download(pal,"out.PAL");
+}
+
+function download(data,name){
+    const a=document.createElement("a");
+    a.href=URL.createObjectURL(new Blob([data]));
+    a.download=name;
+    a.click();
+}
+
+</script>
+</body>
+</html>
